@@ -53,8 +53,16 @@ class TransformerBlock(nn.Module):
             dropout: dropout probability
         """
         super().__init__()
-
-        raise NotImplementedError("TransformerBlock.__init__() is not implemented")
+        self.layer_norm1 = nn.LayerNorm(embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.layer_norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -64,7 +72,14 @@ class TransformerBlock(nn.Module):
         Returns:
             (batch_size, sequence_length, embed_dim) output sequence
         """
-        raise NotImplementedError("TransformerBlock.forward() is not implemented")
+        norm1 = self.layer_norm1(x)
+        attention, _ = self.attention(norm1, norm1, norm1)
+        x = x + attention
+        norm2 = self.layer_norm2(x)
+        x = x + self.mlp(norm2)
+        return x
+
+
 
 
 class PatchEmbedding(nn.Module):
@@ -110,12 +125,31 @@ class PatchEmbedding(nn.Module):
 
 
 class MLPClassifierDeepResidual(nn.Module):
+    # Code from Lecture to define a block
+    class Block(torch.nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.model = torch.nn.Sequential(
+                torch.nn.Linear(in_channels, out_channels),
+                torch.nn.LayerNorm(out_channels),
+                torch.nn.ReLU(),
+            )
+            if in_channels != out_channels:
+                self.skip = torch.nn.Linear(in_channels, out_channels)
+            else:
+                self.skip = torch.nn.Identity()
+
+        def forward(self, x):
+            return self.skip(x) + self.model(x)
+        
     def __init__(
         self,
         h: int = 64,
         w: int = 64,
         num_classes: int = 6,
     ):
+        HIDDEN_DIM = 64
+        HIDDEN_LAYERS = 4
         """
         An MLP with multiple hidden layers and residual connections
 
@@ -129,8 +163,17 @@ class MLPClassifierDeepResidual(nn.Module):
             num_layers: int, number of hidden layers
         """
         super().__init__()
+        layers = []
+        layers.append(torch.nn.Flatten())
+        layers.append(torch.nn.Linear(h*w*3, HIDDEN_DIM, bias=False))
+        for i in range(HIDDEN_LAYERS):
+            layers.append(self.Block(HIDDEN_DIM, HIDDEN_DIM))
+        layers.append(torch.nn.Linear(HIDDEN_DIM, num_classes, bias=False))
 
-        raise NotImplementedError("MLPClassifierDeepResidual.__init__() is not implemented")
+        self.model = torch.nn.Sequential(*layers)
+
+
+        
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -140,7 +183,7 @@ class MLPClassifierDeepResidual(nn.Module):
         Returns:
             tensor (b, num_classes) logits
         """
-        raise NotImplementedError("MLPClassifierDeepResidual.forward() is not implemented")
+        return self.model(x)
 
 
 class ViTClassifier(nn.Module):
@@ -149,6 +192,12 @@ class ViTClassifier(nn.Module):
         h: int = 64,
         w: int = 64,
         num_classes: int = 6,
+        patch_size: int = 8,
+        embed_dim: int = 8,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
     ):
         """
         Vision Transformer (ViT) classifier
@@ -168,7 +217,27 @@ class ViTClassifier(nn.Module):
         """
         super().__init__()
 
-        raise NotImplementedError("ViTClassifier.__init__() is not implemented")
+        self.patch_embedding = PatchEmbedding(img_size=h, patch_size=patch_size, in_channels=3, embed_dim=embed_dim,)
+        num_patches = self.patch_embedding.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        self.positional_embedding = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(num_layers)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.linear = nn.Linear(embed_dim, num_classes)
+
+        # ChatGPT Used to help with initialization values
+        nn.init.trunc_normal_(self.positional_embedding, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.linear.weight, std=0.02)
+        nn.init.constant_(self.linear.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -178,7 +247,26 @@ class ViTClassifier(nn.Module):
         Returns:
             tensor (b, num_classes) logits
         """
-        raise NotImplementedError("ViTClassifier.forward() is not implemented")
+
+        B = x.shape[0]
+
+        x = self.patch_embedding(x)
+
+        # Add CLS token and positional embeddings
+        cls_token = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        x = x + self.positional_embedding
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+
+        # Get output from CLS token
+        cls_out = x[:, 0]
+
+        logits = self.linear(cls_out)
+        return logits
 
 
 model_factory = {
